@@ -1,0 +1,335 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: set-rpms-to-publish-data
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Update the `.components[].rpmsToPublish`
+
+    The task:
+    - pulls RPM files from each component's OCI artifact
+    - update `.components[].rpmsToPublish`
+    - overwrites the snapshot file in-place
+  params:
+    - name: snapshotPath
+      type: string
+      description: Path to the JSON Snapshot spec in the data workspace
+    - name: DEFAULT_EXCLUDES
+      type: string
+      description: comma-delimited list of file patterns to exclude from consideration
+      default: "-debuginfo-, -debugsource-"
+    - name: DEFAULT_ARCHITECTURES
+      type: string
+      description: >-
+        Comma-delimited list of default architectures to use for noarch RPMs when
+        no arch-specific RPMs are found
+      default: "x86_64,aarch64,s390x,ppc64le"
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: skip_release
+      type: string
+      description: "true when all components had no RPMs to publish; otherwise false"
+    - description: Produced trusted data artifact
+      name: sourceDataArtifact
+      type: string
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+    env:
+      # Ensure Tekton creds-init can copy registry creds to a writable $HOME (avoid /tekton/home permission warnings).
+      - name: HOME
+        value: /tmp
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: ORAS_OPTIONS
+        value: "$(params.orasOptions)"
+      - name: DEBUG
+        value: "$(params.trustedArtifactsDebug)"
+    securityContext:
+      runAsUser: 1001
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+          cpu: 30m
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: update-rpm-to-publish
+      image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
+      computeResources:
+        limits:
+          memory: 512Mi
+          cpu: 350m
+        requests:
+          memory: 512Mi
+          cpu: 350m
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+        # Avoid leaking secrets from cli.toml via bash xtrace in task logs.
+        set +x
+
+        SNAPSHOT_FILE="$(params.dataDir)/$(params.snapshotPath)"
+        if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
+          echo "Error: No valid snapshot file was provided at ${SNAPSHOT_FILE}" >&2
+          exit 1
+        fi
+
+        # Re-enable xtrace for the non-secret portions of the task.
+        set -x
+
+        # Parse NEVRA fields from an RPM file (RPM header is authoritative)
+        parse_nevra() {
+          local file_path="$1"
+          local q rc name epoch version release arch
+          set +e
+          q="$(rpm -qp --qf '%{NAME}|%{EPOCH}|%{VERSION}|%{RELEASE}|%{ARCH}\n' "${file_path}" 2>/dev/null)"
+          rc=$?
+          set -e
+          if [[ ${rc} -eq 0 && -n "${q}" ]]; then
+            IFS='|' read -r name epoch version release arch <<< "${q}"
+            if [[ -z "${epoch}" || "${epoch}" == "(none)" ]]; then
+              epoch="0"
+            fi
+            if [[ -n "${name}" && -n "${version}" && -n "${release}" && -n "${arch}" ]]; then
+              echo "${name}|${epoch}|${version}|${release}|${arch}"
+              return 0
+            fi
+          fi
+          echo "Error: Failed to parse NEVRA from RPM header for '${file_path}'" >&2
+          return 1
+        }
+
+        should_exclude_file() {
+          local filename="$1"
+          local patterns_csv="$2"
+          local should_exclude=false
+          local pattern
+          IFS=',' read -ra EXCLUDE_PATTERNS <<< "${patterns_csv}"
+          for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+            pattern="$(echo "${pattern}" | xargs)"
+            [[ -z "${pattern}" ]] && continue
+            if [[ "${filename}" == *"${pattern}"* ]]; then
+              should_exclude=true
+              break
+            fi
+          done
+          [[ "${should_exclude}" == "true" ]]
+        }
+
+        extract_arches_from_files() {
+          local -n files_ref=$1
+          local arches=()
+          local file arch
+          for file in "${files_ref[@]}"; do
+            if [[ "${file}" == *.src.rpm ]] || [[ "${file}" == *.noarch.rpm ]]; then
+              continue
+            fi
+            if [[ "${file}" =~ \\.([^.]+)\\.rpm$ ]]; then
+              arch="${BASH_REMATCH[1]}"
+              if [[ " ${arches[*]} " != *" ${arch} "* ]]; then
+                arches+=("${arch}")
+              fi
+            fi
+          done
+          printf '%s\n' "${arches[@]}"
+        }
+
+        echo "Filtering snapshot RPMs against Pulp..." >&2
+        tmp_out="$(mktemp)"
+        snapshot_json="$(jq '.' "${SNAPSHOT_FILE}")"
+
+        # Build new components array (avoid pipe-to-while subshell so failures abort the task).
+        while IFS= read -r component; do
+          image="$(jq -r '.containerImage' <<< "${component}")"
+          name="$(jq -r '.name' <<< "${component}")"
+          echo "Processing component '${name}' (${image})" >&2
+
+          workdir="$(mktemp -d)"
+          mkdir -p "${workdir}/files"
+          AUTHFILE="${workdir}/auth.json"
+
+          export AUTHFILE
+          # Keep stdout clean (it is consumed as JSON later). Auth/config output isn't needed on stdout here.
+          select-oci-auth "${image}" > "${AUTHFILE}"
+          # Ensure any oras output does not contaminate the JSON stream.
+          # TODO: The rpm should be fetched from pulp canonical namespace with kofnlux-cli/pulp-tool
+          oras pull --registry-config "${AUTHFILE}" "${image}" -o "${workdir}/files" 1>&2
+
+          mapfile -t files < <(
+            set -euo pipefail
+            shopt -s nullglob
+            cd "${workdir}/files"
+            for f in *; do
+              [[ -f "${f}" ]] || continue
+              [[ "${f}" == *.rpm ]] || continue
+              if should_exclude_file "${f}" "$(params.DEFAULT_EXCLUDES)"; then
+                continue
+              fi
+              printf '%s\n' "${f}"
+            done
+          )
+
+          # Determine arches used for noarch targeting
+          mapfile -t ARCHES < <(extract_arches_from_files files)
+          if [[ ${#ARCHES[@]} -eq 0 ]]; then
+            IFS=',' read -ra ARCHES <<< "$(params.DEFAULT_ARCHITECTURES)"
+            for i in "${!ARCHES[@]}"; do
+              ARCHES[i]=$(echo "${ARCHES[i]}" | xargs)
+            done
+          fi
+
+          rpms_to_publish="[]"
+          for f in "${files[@]}"; do
+            file_abs="${workdir}/files/${f}"
+            local_sha="$(sha256sum "${file_abs}" | awk '{print $1}')"
+            nevra="$(parse_nevra "${file_abs}")"
+            IFS='|' read -r rpmname epoch version release arch <<< "${nevra}"
+
+            # Determine target repos
+            # TODO: there will be a task for delivery metadata, it includes the repos mapping
+            target_repos=()
+            if [[ "${f}" == *.src.rpm ]]; then
+              target_repos=("source")
+            elif [[ "${f}" == *.noarch.rpm ]]; then
+              target_repos=("${ARCHES[@]}")
+            else
+              target_repos=("${arch}")
+            fi
+
+
+            target_repos_json="$(printf '%s\n' "${target_repos[@]}" | jq -R . | jq -s .)"
+            rpms_to_publish="$(jq \
+              --arg rpm "${f}" \
+              --arg rpmname "${rpmname}" \
+              --arg arch "${arch}" \
+              --arg epoch "${epoch}" \
+              --arg version "${version}" \
+              --arg release "${release}" \
+              --arg sha256 "${local_sha}" \
+              --argjson targetRepos "${target_repos_json}" \
+              '. + [{
+                rpm: $rpm,
+                rpmname: $rpmname,
+                arch: $arch,
+                epoch: $epoch,
+                version: $version,
+                release: $release,
+                sha256: $sha256,
+                targetRepos: $targetRepos
+              }]' <<< "${rpms_to_publish}")"
+          done
+
+          # Emit component only if there is something to publish
+          if [[ "$(jq 'length' <<< "${rpms_to_publish}")" -gt 0 ]]; then
+            jq --argjson rpmsToPublish "${rpms_to_publish}" '. + {rpmsToPublish: $rpmsToPublish}' <<< "${component}"
+          fi
+
+          rm -rf "${workdir}"
+        done < <(jq -c '.components[]' <<< "${snapshot_json}") | jq -s '{components: .}' > "${tmp_out}"
+
+        # Merge back into snapshot (preserve top-level fields, replace components)
+        jq --slurpfile new "${tmp_out}" '.components = $new[0].components' "${SNAPSHOT_FILE}" > "${SNAPSHOT_FILE}.tmp"
+        mv "${SNAPSHOT_FILE}.tmp" "${SNAPSHOT_FILE}"
+
+        if [[ "$(jq '.components | length' "${SNAPSHOT_FILE}")" -eq 0 ]]; then
+          echo -n "true" > "$(results.skip_release.path)"
+        else
+          echo -n "false" > "$(results.skip_release.path)"
+        fi
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 128Mi
+          cpu: 250m
+        requests:
+          memory: 128Mi
+          cpu: 250m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: "$(params.taskGitUrl)"
+          - name: revision
+            value: "$(params.taskGitRevision)"
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)
